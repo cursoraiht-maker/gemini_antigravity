@@ -93,6 +93,13 @@ struct QuotaResponseData: Decodable {
     }
 }
 
+struct DaemonHubInfo: Decodable {
+    let pid: Int?
+    let httpPort: Int?
+    let httpsPort: Int?
+    let csrfToken: String?
+}
+
 struct ModelBucketInfo {
     let id: String
     let displayName: String
@@ -123,7 +130,7 @@ struct GeminiQuota {
     var claudeWeeklyPercent: Int?
     var claudeWeeklyDescription: String?
     
-    // Gemini 4 Argon metrics (New Model!)
+    // Gemini 4 Argon metrics
     var argonWeeklyPercent: Int?
     var argonDescription: String?
     var argonResetTime: String?
@@ -171,15 +178,22 @@ class QuotaFetcher {
                 }
             }
             
-            // 2. Discover running processes
-            let servers = self.findLanguageServerProcesses()
-            if servers.isEmpty {
-                DispatchQueue.main.async {
-                    completion(.failure(NSError(domain: "QuotaFetcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "Antigravity IDE no está en ejecución"])))
+            // 2. Discover via active daemon files in ~/.gemini/antigravity/daemon/hub_*.json (fastest & standard in newer Antigravity)
+            let daemonCandidates = self.findDaemonConfigs()
+            for candidate in daemonCandidates {
+                if let quota = self.querySchemePort(scheme: candidate.scheme, port: candidate.port, token: candidate.token) {
+                    self.cachedPort = candidate.port
+                    self.cachedScheme = candidate.scheme
+                    self.cachedToken = candidate.token
+                    DispatchQueue.main.async {
+                        completion(.success(quota))
+                    }
+                    return
                 }
-                return
             }
             
+            // 3. Discover running processes (CLI args or env vars)
+            let servers = self.findLanguageServerProcesses()
             for server in servers {
                 var candidatePorts: [Int] = []
                 if let p = server.port {
@@ -295,7 +309,7 @@ class QuotaFetcher {
                                         quota.claudeFiveHourPercent = percent
                                     }
                                 }
-                                // 3. Gemini 4 Argon (New Model)
+                                // 3. Gemini 4 Argon (when listed as separate group)
                                 else if gName.contains("Argon") {
                                     quota.argonWeeklyPercent = percent
                                     quota.argonDescription = bDesc
@@ -330,6 +344,62 @@ class QuotaFetcher {
         return nil
     }
     
+    private func findDaemonConfigs() -> [(port: Int, scheme: String, token: String)] {
+        var candidates: [(port: Int, scheme: String, token: String)] = []
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let daemonDir = home.appendingPathComponent(".gemini/antigravity/daemon")
+        
+        guard let files = try? FileManager.default.contentsOfDirectory(at: daemonDir, includingPropertiesForKeys: [.contentModificationDateKey], options: .skipsHiddenFiles) else {
+            return []
+        }
+        
+        // Sort files by modification date descending (newest first)
+        let sortedFiles = files.filter { $0.lastPathComponent.hasPrefix("hub_") && $0.pathExtension == "json" }
+            .sorted { (url1, url2) -> Bool in
+                let date1 = (try? url1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
+                let date2 = (try? url2.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
+                return date1 > date2
+            }
+        
+        for fileUrl in sortedFiles {
+            guard let data = try? Data(contentsOf: fileUrl),
+                  let hub = try? JSONDecoder().decode(DaemonHubInfo.self, from: data),
+                  let token = hub.csrfToken, !token.isEmpty else {
+                continue
+            }
+            
+            // Prefer httpPort, fallback httpsPort
+            if let httpPort = hub.httpPort {
+                candidates.append((port: httpPort, scheme: "http", token: token))
+            }
+            if let httpsPort = hub.httpsPort {
+                candidates.append((port: httpsPort, scheme: "https", token: token))
+            }
+        }
+        
+        return candidates
+    }
+    
+    private func findEnvCsrfToken(pid: String) -> String? {
+        let psTask = Process()
+        psTask.executableURL = URL(fileURLWithPath: "/bin/ps")
+        psTask.arguments = ["eww", "-p", pid]
+        let pipe = Pipe()
+        psTask.standardOutput = pipe
+        do {
+            try psTask.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            psTask.waitUntilExit()
+            guard let output = String(data: data, encoding: .utf8) else { return nil }
+            if let range = output.range(of: "ANTIGRAVITY_SERVER_CSRF_TOKEN=") {
+                let sub = output[range.upperBound...]
+                let token = sub.components(separatedBy: CharacterSet.whitespacesAndNewlines).first ?? ""
+                if !token.isEmpty { return token }
+            }
+        } catch {}
+        return nil
+    }
+    
     private func findLanguageServerProcesses() -> [(pid: String, token: String, port: Int?)] {
         var results: [(pid: String, token: String, port: Int?)] = []
         
@@ -348,8 +418,8 @@ class QuotaFetcher {
             output = String(data: data, encoding: .utf8) ?? ""
         } catch {}
         
-        // 2. Fallback to ps if pgrep gave no lines with tokens
-        if !output.contains("csrf") {
+        // 2. Fallback to ps if pgrep gave nothing
+        if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let psTask = Process()
             psTask.executableURL = URL(fileURLWithPath: "/bin/ps")
             psTask.arguments = ["-axo", "pid,command"]
@@ -364,14 +434,17 @@ class QuotaFetcher {
         }
         
         for line in output.components(separatedBy: "\n") {
-            guard line.contains("csrf_token") || line.contains("csrf-token") else { continue }
-            
             let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            
+            // Filter to actual agy / language server processes
+            guard trimmed.contains("agy") || trimmed.contains("language_server") || trimmed.contains("language-server") else { continue }
+            
             let parts = trimmed.split(separator: " ", maxSplits: 1)
             guard let first = parts.first, let _ = Int(first) else { continue }
             let pid = String(first)
             
-            // Extract Token
+            // Extract Token from CLI args
             var token = ""
             if let tokenRegex = try? NSRegularExpression(pattern: #"--csrf[-_]token[=\s]+([^\s"']+)"#) {
                 let nsLine = line as NSString
@@ -392,6 +465,11 @@ class QuotaFetcher {
                         if !token.isEmpty { break }
                     }
                 }
+            }
+            
+            // If token not in CLI flags, check process environment variables
+            if token.isEmpty {
+                token = findEnvCsrfToken(pid: pid) ?? ""
             }
             
             guard !token.isEmpty else { continue }
